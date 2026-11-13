@@ -5246,6 +5246,127 @@ class Table(Expr, FixedTextJupyterMixin):
 
         return WindowedTable(self, time_col)
 
+    @util.experimental
+    def overlay_intervals(
+        self,
+        *,
+        start: str | ir.Value,
+        end: str | ir.Value,
+        source: str | ir.Value | None = None,
+        partition_by: Any = (),
+        sources: Iterable[Any] | None = None,
+        other: str | None = None,
+        complete_only: bool = False,
+        null_endpoint: Literal["error", "drop"] = "error",
+        merge: bool = False,
+        names_prefix: str = "",
+    ) -> Table:
+        """Split half-open `[start, end)` intervals into coverage time slices.
+
+        The table is treated as a multiset of half-open intervals. Every
+        distinct endpoint becomes a slice boundary and, within each slice,
+        the number of covering intervals is reported per declared source as
+        a fixed set of integer count columns.
+
+        The computation is compiled entirely in SQL: endpoint events are
+        stacked with `UNION ALL`, same-timestamp start/end events are merged
+        with a `GROUP BY` before the prefix counts are updated over explicit
+        `ROWS` windows, and slice boundaries are produced with a partitioned
+        `LEAD`. Intermediate result sizes stay linear in the number of
+        endpoints instead of growing quadratically in the number of
+        intervals.
+
+        Parameters
+        ----------
+        start
+            Column (name or expression) holding the inclusive interval start.
+        end
+            Column (name or expression) holding the exclusive interval end.
+            Must share the same numeric or temporal dtype as `start`.
+        source
+            Optional column holding the source label. When omitted, a single
+            coverage column named `n` is returned.
+        partition_by
+            Explicit partition keys. All windows are scoped to each
+            partition; NULL keys form their own partition.
+        sources
+            Explicit ordered domain of `source` values defining the fixed
+            output count columns. When omitted the domain is discovered
+            eagerly with a `DISTINCT` query (this breaks laziness).
+        other
+            When set to a string, source values outside the declared
+            `sources` domain (including NULL) are counted in an extra column
+            of that name instead of raising.
+        complete_only
+            When true, only slices covered by every declared source are
+            returned. The `other` bucket is not part of the declared domain.
+        null_endpoint
+            Policy for NULL endpoints: `"error"` (default) raises at
+            execution time, `"drop"` excludes such rows first.
+        merge
+            When false (default) every endpoint boundary is preserved, even
+            if adjacent slices share identical counts. When true, adjacent
+            slices with identical count vectors are merged; slices separated
+            by a gap are never merged.
+        names_prefix
+            Prefix added to every per-source count column name.
+
+        Returns
+        -------
+        Table
+            Partition columns, `window_start` / `window_end` boundary columns
+            (same dtype as the endpoints) and one `int64` count column per
+            declared source (plus the optional `other` bucket), or a single
+            `n` column without a `source`. The output schema is fixed when
+            the expression is built.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "pid": [1, 1, 1],
+        ...         "source": ["a", "b", "a"],
+        ...         "start": [1, 2, 5],
+        ...         "end": [4, 6, 8],
+        ...     }
+        ... )
+        >>> t.overlay_intervals(
+        ...     start="start",
+        ...     end="end",
+        ...     source="source",
+        ...     partition_by="pid",
+        ...     sources=["a", "b"],
+        ... ).order_by("window_start")
+        ┏━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+        ┃ pid   ┃ window_start ┃ window_end ┃ a     ┃ b     ┃
+        ┡━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+        │ int64 │ int64        │ int64      │ int64 │ int64 │
+        ├───────┼──────────────┼────────────┼───────┼───────┤
+        │     1 │            1 │          2 │     1 │     0 │
+        │     1 │            2 │          4 │     1 │     1 │
+        │     1 │            4 │          5 │     0 │     1 │
+        │     1 │            5 │          6 │     1 │     1 │
+        │     1 │            6 │          8 │     1 │     0 │
+        └───────┴──────────────┴────────────┴───────┴───────┘
+        """
+        from ibis.expr.overlay import overlay_intervals
+
+        return overlay_intervals(
+            self,
+            start=start,
+            end=end,
+            source=source,
+            partition_by=partition_by,
+            sources=sources,
+            other=other,
+            complete_only=complete_only,
+            null_endpoint=null_endpoint,
+            merge=merge,
+            names_prefix=names_prefix,
+        )
+
     def value_counts(self, *, name: str | None = None) -> ir.Table:
         """Compute a frequency table of this table's values.
 
