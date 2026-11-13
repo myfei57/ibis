@@ -14,6 +14,7 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
 from ibis.backends import BaseBackend
+from ibis.backends.sql import origins
 from ibis.backends.sql.compilers._compat import Drop
 
 if TYPE_CHECKING:
@@ -133,6 +134,68 @@ class SQLBackend(BaseBackend):
             ) from e
         self._log(sql)
         return sql
+
+    def compile_with_origins(
+        self,
+        expr: ir.Expr,
+        /,
+        *,
+        limit: int | None = None,
+        params: Mapping[ir.Expr, Any] | None = None,
+        pretty: bool = False,
+        max_spans: int = origins.DEFAULT_MAX_ORIGIN_SPANS,
+    ) -> origins.CompiledOrigins:
+        """Compile an expression to SQL with origin span tracking.
+
+        In addition to the compiled SQL string, returns a mapping from UTF-8
+        byte spans of the final SQL back to the identities of the original
+        Ibis operations/fields from which they derive. This allows callers to
+        translate a database error position back to the responsible Ibis
+        expression.
+
+        Parameters
+        ----------
+        expr
+            An ibis expression to compile.
+        limit
+            An integer to effect a specific row limit. A value of `None` means no limit.
+        params
+            Mapping of scalar parameter expressions to value.
+        pretty
+            Pretty print the SQL query during compilation.
+        max_spans
+            Maximum number of origin spans to record. When the generated SQL
+            requires more spans, recording stops and the returned result's
+            `truncated` flag is set to `True`.
+
+        Returns
+        -------
+        CompiledOrigins
+            The compiled SQL together with its span-to-origin mapping.
+        """
+        tracker = origins.OriginTracker(limit=max_spans)
+        compiler = self.compiler
+        compiler._origin_tracker = tracker
+        try:
+            query = compiler.to_sqlglot(expr, limit=limit, params=params)
+        finally:
+            compiler._origin_tracker = None
+
+        generator = tracker.make_generator(
+            self.dialect,
+            pretty=pretty,
+            unsupported_level=sg.ErrorLevel.RAISE,
+        )
+        try:
+            marked_sql = generator.generate(query, copy=False)
+        except sg.UnsupportedError as e:
+            raise exc.UnsupportedOperationError(
+                f"Operation not supported in {self.name} backend: {e}\n\nexpression:\n{expr}\n\nsqlglot expression:\n{query}"
+            ) from e
+
+        result = tracker.build_result(marked_sql)
+        self._log(result.sql)
+        return result
 
     def _log(self, sql: str) -> None:
         """Log `sql`.

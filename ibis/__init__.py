@@ -117,6 +117,8 @@ def load_backend(name: str) -> BaseBackend:
     setattr(ibis, name, proxy)
     proxy.connect = connect
     proxy.compile = backend.compile
+    if hasattr(backend, "compile_with_origins"):
+        proxy.compile_with_origins = backend.compile_with_origins
     proxy.has_operation = backend.has_operation
     proxy.name = name
     proxy._from_url = backend._from_url

@@ -247,7 +247,7 @@ STAR = sge.Star()
 
 @public
 class SQLGlotCompiler(abc.ABC):
-    __slots__ = "f", "v"
+    __slots__ = "_origin_tracker", "f", "v"
 
     agg = AggGen()
     """A generator for handling aggregate functions"""
@@ -455,6 +455,10 @@ class SQLGlotCompiler(abc.ABC):
             dialect=self.__class__.dialect, copy=self.__class__.copy_func_args
         )
         self.v = VarGen()
+        # Opt-in origin tracking state, installed only for the duration of a
+        # compile_with_origins call; ``None`` means the regular trace-free
+        # compilation path.
+        self._origin_tracker = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -624,6 +628,13 @@ class SQLGlotCompiler(abc.ABC):
         # substitute parameters immediately to avoid having to define a
         # ScalarParameter translation rule
         params = self._prepare_params(params)
+
+        tracker = self._origin_tracker
+        if tracker is not None:
+            # assign stable identities on the original DAG, before any
+            # lowering or SQL-specific rewrite takes place
+            tracker.prepare(op)
+
         if self.lowered_ops:
             op = op.replace(reduce(operator.or_, self.lowered_ops.values()))
         op, ctes = sqlize(
@@ -640,28 +651,33 @@ class SQLGlotCompiler(abc.ABC):
         def fn(node, __unused__, **kwargs):
             result = self.visit_node(node, **kwargs)
 
-            # if it's not a relation then we don't need to do anything special
-            if node is op or not isinstance(node, ops.Relation):
-                return result
+            # alias relations other than the root: AliasedRelations use their
+            # explicitly assigned name, otherwise generate one
+            if node is not op and isinstance(node, ops.Relation):
+                alias_name = (
+                    node.name
+                    if isinstance(node, ops.AliasedRelation)
+                    else f"t{next(counter)}"
+                )
+                aliases[node] = alias_name
 
-            # alias ops.AliasedRelations to their explicitly assigned name otherwise generate
-            alias = (
-                node.name
-                if isinstance(node, ops.AliasedRelation)
-                else f"t{next(counter)}"
-            )
-            aliases[node] = alias
+                alias = sg.to_identifier(alias_name, quoted=self.quoted)
+                if isinstance(result, sge.Subquery):
+                    result = result.as_(alias, quoted=self.quoted)
+                else:
+                    try:
+                        result = result.subquery(alias, copy=False)
+                    except AttributeError:
+                        result = result.as_(
+                            alias,
+                            quoted=self.quoted,
+                            table=isinstance(result, sge.Table),
+                        )
 
-            alias = sg.to_identifier(alias, quoted=self.quoted)
-            if isinstance(result, sge.Subquery):
-                return result.as_(alias, quoted=self.quoted)
-            else:
-                try:
-                    return result.subquery(alias, copy=False)
-                except AttributeError:
-                    return result.as_(
-                        alias, quoted=self.quoted, table=isinstance(result, sge.Table)
-                    )
+            if tracker is not None:
+                tracker.tag(node, result, kwargs)
+
+            return result
 
         # apply translate rules in topological order
         results = op.map(fn)
